@@ -1034,6 +1034,7 @@ def configure_local(repo_path=None):
     distro.pkg_manager.create_repo_file(
         repo_url_path,
         gpg_url_path,
+        codename=distro.codename
     )
 
     distro.pkg_manager.import_repo(
@@ -1050,7 +1051,7 @@ def install_calamari(distro=None):
     """ Installs the Calamari web application """
     distro = distro or get_distro()
     logger.debug('installing Calamari...')
-    distro.pkg_manager.install('calamari')
+    distro.pkg_manager.install('calamari-clients')
 
 
 def install_ceph_deploy(distro=None):
