@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
+import getpass
 import logging
 import os
 import platform
@@ -31,6 +32,7 @@ import tarfile
 import tempfile
 import urllib2
 import urlparse
+from ConfigParser import SafeConfigParser, NoSectionError, NoOptionError
 
 from functools import wraps
 from textwrap import dedent
@@ -411,11 +413,33 @@ priority=1
 gpgkey={gpg_url}
 """
 
+ceph_deploy_updates_yum_template = """
+[ceph_deploy_updates]
+name=ceph_deploy_updates packages for $basearch
+baseurl={repo_url}
+enabled=0
+gpgcheck=1
+type=rpm-md
+priority=1
+gpgkey={gpg_url}
+"""
+
 calamari_yum_template = """
 [calamari]
 name=calamari packages for $basearch
 baseurl={repo_url}
 enabled=1
+gpgcheck=1
+type=rpm-md
+priority=1
+gpgkey={gpg_url}
+"""
+
+calamari_updates_yum_template = """
+[calamari_updates]
+name=calamari_updates packages for $basearch
+baseurl={repo_url}
+enabled=0
 gpgcheck=1
 type=rpm-md
 priority=1
@@ -428,6 +452,17 @@ name=Ceph
 baseurl={repo_url}
 gpgkey={gpg_url}
 default=true
+priority=1
+proxy=_none_
+"""
+
+ceph_updates_yum_template = """
+[ceph_updates]
+name=Ceph_updates packages
+baseurl={repo_url}
+gpgkey={gpg_url}
+default=true
+enabled=0
 priority=1
 proxy=_none_
 """
@@ -477,6 +512,10 @@ yum_templates = {
     'calamari-server': calamari_yum_template,
     'ceph-deploy': ceph_deploy_yum_template,
     'ceph': ceph_yum_template,
+    'calamari-server-updates': calamari_updates_yum_template,
+    'ceph-deploy-updates': ceph_deploy_updates_yum_template,
+    'ceph-updates': ceph_updates_yum_template,
+
 }
 
 apt_templates = {
@@ -594,6 +633,47 @@ class Yum(object):
     def update(cls):
         # stub
         pass
+
+    @classmethod
+    def sync(cls, repos):
+        # resolve needed dependencies
+        if not which('reposync'):
+            cls.install('yum-utils')
+        if not which('createrepo'):
+            cls.install('createrepo')
+
+        # infer the path to the ceph repo by looking at cephdeploy.conf because
+        # we never overwrite ceph, rather, we rely on versions so the path for
+        # ceph can have multiple versions already, like ``static/ceph/0.80``
+        # and ``static/ceph/0.86``
+        destinations = {
+            'ceph': infer_ceph_repo(),
+            'ceph-deploy': '/opt/ICE/ceph-deploy',
+            'calamari': '/opt/ICE/calamari-server',
+        }
+
+        repo_ids = {
+            'ceph-deploy': 'ceph_deploy_updates',
+            'ceph': 'ceph_updates',
+            'calamari': 'calamari_updates',
+        }
+
+        for repo in repos:
+            destination = destinations[repo]
+            repoid = repo_ids[repo]
+            run(
+                [
+                    'reposync',
+                    '--repoid=%s' % repoid,
+                    '--newest-only',
+                    '--norepopath',
+                    '-p',
+                    destination
+                ]
+            )
+
+            run(['createrepo', destination ])
+            run(['yum', 'clean', 'all'])
 
     @classmethod
     def enumerate_repo(cls, path):
@@ -969,6 +1049,93 @@ def get_repo_path(repo_dir_name=None, traverse=False):
     return repo_path
 
 
+def get_ceph_deploy_conf_paths():
+    """
+    Return all the possible cephdeploy.conf locations including the one for
+    ``root`` if the user is calling us with ``sudo`` and not as ``root`` user.
+    """
+    configs = [
+        os.path.join(os.getcwd(), 'cephdeploy.conf'),
+        os.path.expanduser(u'~/.cephdeploy.conf'),
+    ]
+    sudoer_user = os.environ.get('SUDO_USER')
+    if sudoer_user:
+        sudoer_home = os.path.expanduser('~' + sudoer_user)
+        configs.append(os.path.join(sudoer_home, '.cephdeploy.conf'))
+
+    return configs
+
+
+# =============================================================================
+# System Utils
+# =============================================================================
+
+
+def which(executable):
+    """find the location of an executable"""
+    if 'PATH' in os.environ:
+        envpath = os.environ['PATH']
+    else:
+        envpath = os.defpath
+    PATH = envpath.split(os.pathsep)
+
+    locations = PATH + [
+        '/usr/local/bin',
+        '/bin',
+        '/usr/bin',
+        '/usr/local/sbin',
+        '/usr/sbin',
+        '/sbin',
+    ]
+
+    for location in locations:
+        executable_path = os.path.join(location, executable)
+        if os.path.exists(executable_path):
+            return executable_path
+
+
+def infer_ceph_repo(_configs=None):
+    """
+    Because ceph repositories are being handled by version and stored with the
+    version as part of the directory structure (e.g. 'ceph/0.80/') there is
+    a chance that a customer may have more than one version (if they happened
+    to do an upgrade at some point) and end up with several other directories.
+
+    This function helps determine what is the *current* version that the server
+    is using, by inspecting `cephdeploy.conf` and looking into the ``[ceph]``
+    repo section which should define the proper url, and therefore the proper
+    directory we should use.
+    """
+    configs = _configs or get_ceph_deploy_conf_paths()
+    config = None
+    for conf in configs:
+        if os.path.exists(conf):
+            config = conf
+            break
+
+    if not config:
+        logger.error('tried looking for a valid cephdeploy.conf file but failed')
+        raise FileNotFound(configs[0])
+
+    parser = SafeConfigParser()
+    parser.read(config)
+
+    try:
+        http_path = parser.get('ceph', 'baseurl')
+    except (NoSectionError, NoOptionError):
+        msg = 'could not find a ``ceph`` repo section at %s' % config
+        raise ICEError(msg)
+
+    directories = http_path.split('/')
+    # if we had a trailing slash fallback the next item
+    # In [4]: 'http://fqdn/static/ceph/0.80/'.split('/')
+    # Out[4]: ['http:', '', 'fqdn', 'static', 'ceph', '0.80', '']
+    directory = directories[-1] or directories[-2]
+
+    return os.path.join('/opt/calamari/webapp/content/ceph', directory)
+
+
+
 # =============================================================================
 # Prompts
 # =============================================================================
@@ -1017,6 +1184,12 @@ def prompt(question, default=None, lowercase=False, _raw_input=None):
         if lowercase:
             return response.lower()
         return response
+
+
+def prompt_pass():
+    prefix = '%s-->%s ' % (COLOR_SEQ % (30 + COLORS['INFO']), RESET_SEQ)
+    prompt_format = '{prefix}Password: '.format(prefix=prefix)
+    return getpass.getpass(prompt_format)
 
 
 def strtobool(val):
@@ -1195,7 +1368,61 @@ def configure_ceph_deploy(master, minion_url, minion_gpg_url,
             rc_file.write(contents)
 
 
-def configure_local(name, repo_path=None):
+def configure_updates(name, username=None, password=None):
+    """
+    Configure the current host so that it can pull updates for either local
+    repos or repos that it currently hosts.
+
+    :param name: The name of the repository to be configured, e.g.
+                 calamari-server-updates or ceph-deploy-updates
+    """
+    if not username or not password:
+        logger.info('You will need to provide your credentials for the update repository')
+        username = prompt('Username:')
+        password = prompt_pass()
+
+    update_repo_urls = {
+        # XXX these need the right url, stubs for now.
+        'ceph-updates': 'http://{user}:{password}@ceph.com/rpm-firefly/el6/x86_64/',
+        'ceph-deploy-updates': 'http://{user}:{password}@ceph.com/rpm-firefly/el6/noarch/',
+        'calamari-server-updates': 'http://{user}:{password}@ceph.com/rpm-firefly/el6/noarch/',
+    }
+
+    # piggy back from the local repos
+    update_gpg_urls = {
+        'ceph-updates': 'file://%s' % os.path.join(infer_ceph_repo(), 'release.asc'),
+        'ceph-deploy-updates': 'file:///opt/ICE/ceph-deploy/release.asc',
+        'calamari-server-updates': 'file:///opt/ICE/calamari-server/release.asc',
+    }
+
+    repo_url = update_repo_urls[name].format(
+        user=username,
+        password=password,
+    )
+
+    gpg_url = update_gpg_urls[name]
+
+
+    distro = get_distro()
+    distro.pkg_manager.create_repo_file(
+        name,
+        repo_url,
+        gpg_url,
+        file_name=name,
+        codename=distro.codename,
+    )
+
+    distro.pkg_manager.import_repo(
+        update_gpg_urls[name],
+    )
+
+    # call update on the package manager
+    distro.pkg_manager.update()
+    logger.info('this host now has a local updates repository for %s' % name)
+    logger.info('you can update those packages with your package manager')
+
+
+def configure_local(name, repo_path=None, repo_only=False):
     """
     Configure the current host so that it can serve as a *local* repo server
     and we can then install Calamari and ceph-deploy.
@@ -1218,13 +1445,14 @@ def configure_local(name, repo_path=None):
     )
 
     # overwrite the repo with the new packages
-    overwrite_dir(
-        repo_path,
-        destination=os.path.join(
-            repo_dest_prefix,
-            name,
+    if not repo_only:
+        overwrite_dir(
+            repo_path,
+            destination=os.path.join(
+                repo_dest_prefix,
+                name,
+            )
         )
-    )
 
     distro = get_distro()
     distro.pkg_manager.create_repo_file(
@@ -1241,7 +1469,7 @@ def configure_local(name, repo_path=None):
 
     # call update on the package manager
     distro.pkg_manager.update()
-    logger.info('this host now has a local repository for ceph-deploy, and Calamari')
+    logger.info('this host now has a local repository for %s' % name)
     logger.info('you can install those packages with your package manager')
 
 
@@ -1273,6 +1501,7 @@ def default():
         '2. Install Calamari web application on the ICE Node (current host)',
         '3. Install ceph-deploy on the ICE Node (current host)',
         '4. Configure host as a ceph and calamari minion repository for remote hosts',
+        '5. Calamari minion repository setup',
     ]
 
     logger.info('this script will setup Calamari, package repo, and ceph-deploy')
@@ -1358,6 +1587,25 @@ def default():
         codename=distro.codename,
     )
 
+    # step six, the song ended, there is no six, lets try with
+    # some bricks jumping up and down like tics that cliques
+    logger.info('')
+    logger.info('\
+        {markup} \
+        Step 6: Configure the update repositories \
+        {markup}'.format(markup='===='))
+    logger.info('')
+    logger.info('You will need to provide your credentials for the update repositories')
+
+    updates_username = prompt('Username:')
+    updates_password = prompt_pass()
+
+    # configure the updates repos:
+    configure_updates('calamari-server-updates', updates_username, updates_password)
+    configure_updates('ceph-deploy-updates', updates_username, updates_password)
+    configure_updates('ceph-updates', updates_username, updates_password)
+
+    logger.info('')
     logger.info('Setup has completed.')
     logger.info('If installing Calamari for the first time:')
     logger.info('')
@@ -1393,12 +1641,92 @@ def interactive_help(mode='interactive mode'):
     prompt_continue()
 
 
+class UpdateRepo(object):
+
+    _help = dedent("""
+    Updates local repositories by synchronizing with remote update repositories.
+
+    Commands:
+
+      all         Updates all repositories configured for this host
+                  (ceph, ceph-deploy, and calamari)
+
+      configure   Installs/updates (all) the repo files for updates
+
+    Optional Arguments:
+
+      ceph        Update the ceph repo
+      ceph-deploy Update the ceph-deploy repo
+      calamari    Update the calamari repo
+
+    Examples:
+
+    Update all of the repos available:
+
+      sudo python ice_setup.py update all
+
+    Update the calamari and ceph repos:
+
+      sudo python ice_setup.py update ceph calamari
+
+    Update just the ceph-deploy repository:
+
+      sudo python ice_setup.py update ceph-deploy
+
+    Configure the repositories for async updates:
+
+      sudo python ice_setup.py update configure
+    """)
+
+    def __init__(self, argv):
+        self.argv = argv
+        self.optional_arguments = ['ceph', 'ceph-deploy', 'calamari']
+
+    def parse_args(self):
+        options = ['all', 'configure']
+        parser = Transport(self.argv, options=options)
+        parser.catch_help = self._help
+        parser.parse_args()
+
+        sudo_check()
+
+        if parser.has('all'):
+            update_repo(self.optional_arguments)
+
+        if parser.has('configure'):
+            # configure the updates repos:
+            logger.info('You will need to provide your credentials for the update repositories')
+
+            username = prompt('Username:')
+            password = prompt_pass()
+
+            configure_updates('calamari-server-updates', username, password)
+            configure_updates('ceph-deploy-updates', username, password)
+            configure_updates('ceph-updates', username, password)
+
+        else:
+            if parser.arguments:
+                update_repo(
+                        [i for i in parser.arguments if i in self.optional_arguments]
+                )
+
+
+def update_repo(repos):
+    distro = get_distro()
+    logger.debug('updating repo%s: %s' % (
+        's' if len(repos) > 1 else '',
+        ' '.join(repos)
+        )
+    )
+    distro.pkg_manager.sync(repos)
+
 # =============================================================================
 # Main
 # =============================================================================
 
 command_map = {
     'configure': Configure,
+    'update': UpdateRepo,
 }
 
 
@@ -1409,6 +1737,7 @@ def ice_help():
     Subcommands:
 
       configure         Configuration of the ICE node
+      update            Update local repositories from hosted repos.
     """
     return '%s\n%s\n%s\n%s' % (
         help_header,
